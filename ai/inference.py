@@ -19,6 +19,18 @@ MODEL_REPO = "ClementP/FundusDRGrading-resnet50"
 
 INPUT_SIZE = 512
 
+# Absolute paths make the script work when Node.js launches it
+# from a different working directory (important on Render).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Render's filesystem is ephemeral, so keep the Hugging Face cache
+# outside the source tree. The model is downloaded only once per
+# running service because we also keep the loaded model in memory.
+HF_CACHE_DIR = os.getenv(
+    "HF_CACHE_DIR",
+    "/tmp/huggingface"
+)
+
 CLASSES = [
     "No DR",
     "Mild DR",
@@ -27,9 +39,18 @@ CLASSES = [
     "Proliferative DR"
 ]
 
-OUTPUT_DIR = "outputs"
+OUTPUT_DIR = os.path.join(
+    BASE_DIR,
+    "outputs"
+)
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+# Loaded once and reused for subsequent requests.
+MODEL = None
 
 
 # ============================================================
@@ -44,6 +65,14 @@ print(
     f"Using device: {DEVICE}",
     file=sys.stderr
 )
+
+# Render will normally run on CPU. Keep CPU usage predictable.
+try:
+    torch.set_num_threads(
+        int(os.getenv("TORCH_NUM_THREADS", "2"))
+    )
+except ValueError:
+    pass
 
 
 # ============================================================
@@ -70,29 +99,60 @@ transform = transforms.Compose([
 
 def load_model():
 
+    global MODEL
+
+    # IMPORTANT for Render:
+    # Do not download/load the model for every uploaded image.
+    if MODEL is not None:
+        return MODEL
+
     print(
         "Loading DR model...",
         file=sys.stderr
     )
 
-    # Download model weights if not already cached
-    weights_path = hf_hub_download(
-        repo_id=MODEL_REPO,
-        filename="model.safetensors"
+    os.makedirs(
+        HF_CACHE_DIR,
+        exist_ok=True
     )
 
-    # IMPORTANT:
-    #
-    # This checkpoint uses regression.
-    #
-    # Therefore:
-    #
+    # Optional Hugging Face token. Public repositories work without it,
+    # but HF_TOKEN can be supplied as a Render environment variable.
+    hf_token = os.getenv("HF_TOKEN")
+
+    download_args = {
+        "repo_id": MODEL_REPO,
+        "filename": "model.safetensors",
+        "cache_dir": HF_CACHE_DIR
+    }
+
+    if hf_token:
+        download_args["token"] = hf_token
+
+    # Download model weights if they are not already cached.
+    # Extra logs make it clear whether startup is waiting on the
+    # Hugging Face download or on PyTorch model initialization.
+    print(
+        "Downloading/checking DR model weights from Hugging Face...",
+        file=sys.stderr,
+        flush=True
+    )
+
+    weights_path = hf_hub_download(
+        **download_args
+    )
+
+    print(
+        f"Model weights available at: {weights_path}",
+        file=sys.stderr,
+        flush=True
+    )
+
+    # This checkpoint uses regression:
     # fc = Linear(2048, 1)
     #
-    # NOT:
-    #
-    # fc = Linear(2048, 5)
-
+    # The output is a continuous DR severity score from which
+    # the prototype maps to grades 0-4 below.
     model = timm.create_model(
         "resnet50",
         pretrained=False,
@@ -101,8 +161,26 @@ def load_model():
 
     from safetensors.torch import load_file
 
+    print(
+        "Loading safetensors weights...",
+        file=sys.stderr,
+        flush=True
+    )
+
     state_dict = load_file(
         weights_path
+    )
+
+    print(
+        "Safetensors loaded successfully.",
+        file=sys.stderr,
+        flush=True
+    )
+
+    print(
+        "Loading weights into ResNet50...",
+        file=sys.stderr,
+        flush=True
     )
 
     model.load_state_dict(
@@ -110,16 +188,37 @@ def load_model():
         strict=True
     )
 
+    print(
+        "ResNet50 weights loaded successfully.",
+        file=sys.stderr,
+        flush=True
+    )
+
+    print(
+        f"Moving model to {DEVICE}...",
+        file=sys.stderr,
+        flush=True
+    )
+
     model = model.to(DEVICE)
+
+    print(
+        "Model moved to device.",
+        file=sys.stderr,
+        flush=True
+    )
 
     model.eval()
 
+    MODEL = model
+
     print(
         "DR model loaded successfully.",
-        file=sys.stderr
+        file=sys.stderr,
+        flush=True
     )
 
-    return model
+    return MODEL
 
 
 # ============================================================
@@ -706,6 +805,12 @@ def analyze(image_path):
             output.squeeze().item()
         )
 
+    print(
+        f"Raw DR model score: {score:.4f}",
+        file=sys.stderr,
+        flush=True
+    )
+
 
     # --------------------------------------------------------
     # Convert regression score to DR grade
@@ -776,10 +881,15 @@ def analyze(image_path):
         "_gradcam.jpg"
     )
 
+    # Absolute filesystem path for Node.js.
     heatmap_path = os.path.join(
         OUTPUT_DIR,
         filename
     )
+
+    # URL path is intentionally NOT generated here.
+    # Node.js should expose /outputs as a static directory.
+    # This keeps Python independent of the Render domain.
 
     save_gradcam(
         image_path,
@@ -812,7 +922,11 @@ def analyze(image_path):
 
         "explainability": {
 
+            # Absolute path: Node can use this to construct the public URL.
             "gradcam": heatmap_path,
+
+            # Filename: convenient for serving /outputs/<filename>.
+            "gradcamFilename": filename,
 
             "description":
                 "Highlighted regions show areas that contributed strongly to the model's DR severity prediction."
