@@ -180,5 +180,3 @@ app.listen(PORT, () => {
 
     console.log("\nWaiting for images...\n");
 });
-
-#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
