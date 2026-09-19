@@ -121,12 +121,10 @@ app.post("/api/analyze", upload.single("image"), async (req, res) => {
 
         const baseUrl = `${req.protocol}://${req.get("host")}`;
 
-        if (result.gradcam) {
-            // If the AI service returns the Grad-CAM image itself (e.g. base64 or its own URL),
-            // adjust this depending on what /analyze actually sends back.
-            result.gradcamUrl = result.gradcam.startsWith("http")
-                ? result.gradcam
-                : `${AI_SERVICE_URL}/outputs/${path.basename(result.gradcam)}`;
+        // inference.py nests the heatmap path under explainability.gradcam,
+        // not top-level "gradcam" — read it from the right place.
+        if (result.explainability && result.explainability.gradcam) {
+            result.gradcamUrl = `${AI_SERVICE_URL}/outputs/${path.basename(result.explainability.gradcam)}`;
         }
 
         result.imageUrl = `${baseUrl}/uploads/${path.basename(imagePath)}`;
