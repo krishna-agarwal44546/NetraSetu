@@ -1,5 +1,6 @@
 import sys
 import os
+import gc
 import json
 import cv2
 import numpy as np
@@ -17,7 +18,12 @@ from huggingface_hub import hf_hub_download
 
 MODEL_REPO = "ClementP/FundusDRGrading-resnet50"
 
-INPUT_SIZE = 512
+# Lowered from 512 -> 256 by default. This roughly quarters the
+# memory used by every activation map in the network (memory
+# scales with width x height), which matters a lot on a 512MB
+# instance. Override with the INPUT_SIZE env var if you have
+# more headroom (e.g. running locally or on a bigger instance).
+INPUT_SIZE = int(os.getenv("INPUT_SIZE", "256"))
 
 # Absolute paths make the script work when Node.js launches it
 # from a different working directory (important on Render).
@@ -129,9 +135,6 @@ def load_model():
     if hf_token:
         download_args["token"] = hf_token
 
-    # Download model weights if they are not already cached.
-    # Extra logs make it clear whether startup is waiting on the
-    # Hugging Face download or on PyTorch model initialization.
     print(
         "Downloading/checking DR model weights from Hugging Face...",
         file=sys.stderr,
@@ -171,27 +174,9 @@ def load_model():
         weights_path
     )
 
-    print(
-        "Safetensors loaded successfully.",
-        file=sys.stderr,
-        flush=True
-    )
-
-    print(
-        "Loading weights into ResNet50...",
-        file=sys.stderr,
-        flush=True
-    )
-
     model.load_state_dict(
         state_dict,
         strict=True
-    )
-
-    print(
-        "ResNet50 weights loaded successfully.",
-        file=sys.stderr,
-        flush=True
     )
 
     print(
@@ -201,12 +186,6 @@ def load_model():
     )
 
     model = model.to(DEVICE)
-
-    print(
-        "Model moved to device.",
-        file=sys.stderr,
-        flush=True
-    )
 
     model.eval()
 
@@ -253,148 +232,54 @@ def assess_image_quality(image_path):
     issues = []
 
     if width < 300 or height < 300:
-
-        issues.append(
-            "Image resolution is too low"
-        )
-
+        issues.append("Image resolution is too low")
 
     # --------------------------------------------------------
     # Grayscale
     # --------------------------------------------------------
 
-    gray = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2GRAY
-    )
-
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # --------------------------------------------------------
-    # Blur detection
-    #
-    # Variance of Laplacian
-    # Higher = sharper
-    # Lower = blurrier
+    # Blur detection (variance of Laplacian)
     # --------------------------------------------------------
 
-    blur_score = cv2.Laplacian(
-        gray,
-        cv2.CV_64F
-    ).var()
-
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
 
     # --------------------------------------------------------
-    # Brightness
+    # Brightness / Contrast / Saturation
     # --------------------------------------------------------
 
-    brightness = np.mean(
-        gray
-    )
+    brightness = np.mean(gray)
+    contrast = np.std(gray)
 
-
-    # --------------------------------------------------------
-    # Contrast
-    # --------------------------------------------------------
-
-    contrast = np.std(
-        gray
-    )
-
-
-    # --------------------------------------------------------
-    # Color saturation
-    # --------------------------------------------------------
-
-    hsv = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2HSV
-    )
-
-    saturation = np.mean(
-        hsv[:, :, 1]
-    )
-
-
-    # --------------------------------------------------------
-    # Detect extremely dark image
-    # --------------------------------------------------------
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    saturation = np.mean(hsv[:, :, 1])
 
     if brightness < 30:
-
-        issues.append(
-            "Image is too dark"
-        )
-
-
-    # --------------------------------------------------------
-    # Detect extremely bright image
-    # --------------------------------------------------------
+        issues.append("Image is too dark")
 
     if brightness > 225:
-
-        issues.append(
-            "Image is overexposed"
-        )
-
-
-    # --------------------------------------------------------
-    # Detect low contrast
-    # --------------------------------------------------------
+        issues.append("Image is overexposed")
 
     if contrast < 20:
-
-        issues.append(
-            "Image has very low contrast"
-        )
-
-
-    # --------------------------------------------------------
-    # Blur threshold
-    #
-    # This threshold is only for the prototype.
-    # It should be calibrated using your dataset.
-    # --------------------------------------------------------
+        issues.append("Image has very low contrast")
 
     if blur_score < 50:
-
-        issues.append(
-            "Image appears blurry"
-        )
-
+        issues.append("Image appears blurry")
 
     # --------------------------------------------------------
     # Fundus field-of-view check
-    #
-    # Estimate how much of the image is non-black.
     # --------------------------------------------------------
 
-    gray_resized = cv2.resize(
-        gray,
-        (256, 256)
-    )
+    gray_resized = cv2.resize(gray, (256, 256))
 
-    non_black = np.sum(
-        gray_resized > 15
-    )
-
-    total_pixels = (
-        gray_resized.shape[0]
-        *
-        gray_resized.shape[1]
-    )
-
-    field_ratio = (
-        non_black /
-        total_pixels
-    )
-
+    non_black = np.sum(gray_resized > 15)
+    total_pixels = gray_resized.shape[0] * gray_resized.shape[1]
+    field_ratio = non_black / total_pixels
 
     if field_ratio < 0.25:
-
-        issues.append(
-            "Fundus field of view is too small"
-        )
-
+        issues.append("Fundus field of view is too small")
 
     # --------------------------------------------------------
     # QUALITY SCORE
@@ -402,101 +287,48 @@ def assess_image_quality(image_path):
 
     score = 100
 
-
-    # Blur
     if blur_score < 50:
-
         score -= 30
-
     elif blur_score < 100:
-
         score -= 15
 
-
-    # Brightness
     if brightness < 30 or brightness > 225:
-
         score -= 20
 
-
-    # Contrast
     if contrast < 20:
-
         score -= 20
-
     elif contrast < 30:
-
         score -= 10
 
-
-    # Field of view
     if field_ratio < 0.25:
-
         score -= 25
-
     elif field_ratio < 0.40:
-
         score -= 10
 
+    score = max(0, min(100, score))
 
-    score = max(
-        0,
-        min(
-            100,
-            score
-        )
-    )
+    usable = (len(issues) == 0 and score >= 60)
 
-
-    usable = (
-        len(issues) == 0
-        and score >= 60
-    )
-
-
-    return {
-
+    result = {
         "usable": usable,
-
-        "score": round(
-            float(score),
-            2
-        ),
-
+        "score": round(float(score), 2),
         "metrics": {
-
-            "blurScore": round(
-                float(blur_score),
-                2
-            ),
-
-            "brightness": round(
-                float(brightness),
-                2
-            ),
-
-            "contrast": round(
-                float(contrast),
-                2
-            ),
-
-            "saturation": round(
-                float(saturation),
-                2
-            ),
-
-            "fieldOfViewRatio": round(
-                float(field_ratio),
-                3
-            ),
-
+            "blurScore": round(float(blur_score), 2),
+            "brightness": round(float(brightness), 2),
+            "contrast": round(float(contrast), 2),
+            "saturation": round(float(saturation), 2),
+            "fieldOfViewRatio": round(float(field_ratio), 3),
             "width": width,
-
             "height": height
         },
-
         "issues": issues
     }
+
+    # Free the full-resolution image arrays now that we're done
+    # with them, rather than waiting for the function to return.
+    del img, gray, hsv, gray_resized
+
+    return result
 
 
 # ============================================================
@@ -505,21 +337,13 @@ def assess_image_quality(image_path):
 
 def preprocess_image(image_path):
 
-    image = Image.open(
-        image_path
-    ).convert("RGB")
+    image = Image.open(image_path).convert("RGB")
 
-    tensor = transform(
-        image
-    )
+    tensor = transform(image)
+    tensor = tensor.unsqueeze(0)
+    tensor = tensor.to(DEVICE)
 
-    tensor = tensor.unsqueeze(
-        0
-    )
-
-    tensor = tensor.to(
-        DEVICE
-    )
+    image.close()
 
     return tensor
 
@@ -527,124 +351,77 @@ def preprocess_image(image_path):
 # ============================================================
 # GRAD-CAM
 # ============================================================
+#
+# generate() now does BOTH the prediction and the Grad-CAM
+# heatmap in a single forward + backward pass, instead of running
+# the model twice (once under no_grad for the score, once again
+# with gradients enabled for the heatmap). This removes one full
+# ResNet50 forward pass per request.
 
 class GradCAM:
 
-    def __init__(
-        self,
-        model,
-        target_layer
-    ):
+    def __init__(self, model, target_layer):
 
         self.model = model
-
-        self.target_layer = (
-            target_layer
-        )
+        self.target_layer = target_layer
 
         self.activations = None
-
         self.gradients = None
 
-        # Forward hook
-        self.forward_handle = (
-            target_layer.register_forward_hook(
-                self.forward_hook
-            )
+        self.forward_handle = target_layer.register_forward_hook(
+            self.forward_hook
         )
 
-        # Backward hook
-        self.backward_handle = (
-            target_layer.register_full_backward_hook(
-                self.backward_hook
-            )
+        self.backward_handle = target_layer.register_full_backward_hook(
+            self.backward_hook
         )
 
+    def forward_hook(self, module, input, output):
+        self.activations = output.detach()
 
-    def forward_hook(
-        self,
-        module,
-        input,
-        output
-    ):
+    def backward_hook(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0].detach()
 
-        self.activations = (
-            output.detach()
-        )
+    def generate(self, tensor):
+        """
+        Runs a single forward + backward pass.
+        Returns (cam, score) so the caller doesn't need a
+        separate no_grad() forward pass just to get the score.
+        """
 
+        self.model.zero_grad(set_to_none=True)
 
-    def backward_hook(
-        self,
-        module,
-        grad_input,
-        grad_output
-    ):
-
-        self.gradients = (
-            grad_output[0].detach()
-        )
-
-
-    def generate(
-        self,
-        tensor
-    ):
-
-        self.model.zero_grad(
-            set_to_none=True
-        )
-
-        output = self.model(
-            tensor
-        )
+        output = self.model(tensor)
 
         # Regression output
-        score = output[0, 0]
+        score_tensor = output[0, 0]
+
+        # Capture the raw score value BEFORE backward(), since
+        # backward() frees parts of the graph.
+        score = score_tensor.item()
 
         # Backpropagate regression score
-        score.backward()
+        score_tensor.backward()
 
         if self.gradients is None:
+            raise RuntimeError("Grad-CAM gradients were not captured.")
 
-            raise RuntimeError(
-                "Grad-CAM gradients were not captured."
-            )
-
-        gradients = (
-            self.gradients
-        )
-
-        activations = (
-            self.activations
-        )
+        gradients = self.gradients
+        activations = self.activations
 
         # Global average pooling
-        weights = gradients.mean(
-            dim=(2, 3),
-            keepdim=True
-        )
+        weights = gradients.mean(dim=(2, 3), keepdim=True)
 
         # Weighted feature maps
-        cam = (
-            weights *
-            activations
-        ).sum(
-            dim=1,
-            keepdim=True
-        )
+        cam = (weights * activations).sum(dim=1, keepdim=True)
 
         # Remove negative values
-        cam = torch.relu(
-            cam
-        )
+        cam = torch.relu(cam)
 
-        # Resize to original input
+        # Resize to model input size
         cam = torch.nn.functional.interpolate(
             cam,
-            size=(
-                INPUT_SIZE,
-                INPUT_SIZE
-            ),
+            size=(INPUT_SIZE, INPUT_SIZE),
             mode="bilinear",
             align_corners=False
         )
@@ -653,22 +430,25 @@ class GradCAM:
 
         # Normalize
         cam -= cam.min()
-
         max_value = cam.max()
-
         if max_value > 0:
-
             cam /= max_value
 
-        return (
-            cam.cpu().numpy()
-        )
+        cam_np = cam.detach().cpu().numpy()
 
+        # Explicitly drop references to the large intermediate
+        # tensors now that we've copied out what we need. This
+        # matters on a tight memory budget more than it would
+        # normally, since Python doesn't guarantee immediate
+        # collection otherwise.
+        del output, score_tensor, gradients, activations, weights, cam
+        self.activations = None
+        self.gradients = None
+
+        return cam_np, score
 
     def close(self):
-
         self.forward_handle.remove()
-
         self.backward_handle.remove()
 
 
@@ -676,48 +456,19 @@ class GradCAM:
 # SAVE GRAD-CAM
 # ============================================================
 
-def save_gradcam(
-    image_path,
-    cam,
-    output_path
-):
+def save_gradcam(image_path, cam, output_path):
 
-    original = cv2.imread(
-        image_path
-    )
+    original = cv2.imread(image_path)
+    original = cv2.resize(original, (INPUT_SIZE, INPUT_SIZE))
 
-    original = cv2.resize(
-        original,
-        (
-            INPUT_SIZE,
-            INPUT_SIZE
-        )
-    )
+    heatmap = np.uint8(255 * cam)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
-    # Convert CAM to 0-255
-    heatmap = np.uint8(
-        255 * cam
-    )
+    overlay = cv2.addWeighted(original, 0.6, heatmap, 0.4, 0)
 
-    # OpenCV heatmap
-    heatmap = cv2.applyColorMap(
-        heatmap,
-        cv2.COLORMAP_JET
-    )
+    cv2.imwrite(output_path, overlay)
 
-    # Overlay
-    overlay = cv2.addWeighted(
-        original,
-        0.6,
-        heatmap,
-        0.4,
-        0
-    )
-
-    cv2.imwrite(
-        output_path,
-        overlay
-    )
+    del original, heatmap, overlay
 
 
 # ============================================================
@@ -726,49 +477,26 @@ def save_gradcam(
 
 def analyze(image_path):
 
-    if not os.path.exists(
-        image_path
-    ):
-
+    if not os.path.exists(image_path):
         return {
-
             "status": "error",
-
-            "message":
-                "Image file does not exist."
+            "message": "Image file does not exist."
         }
-
 
     # --------------------------------------------------------
     # QUALITY CHECK
     # --------------------------------------------------------
 
-    quality = assess_image_quality(
-        image_path
-    )
-
-
-    # --------------------------------------------------------
-    # Reject bad image
-    # --------------------------------------------------------
+    quality = assess_image_quality(image_path)
 
     if not quality["usable"]:
-
         return {
-
             "status": "unusable",
-
-            "message":
-                "Fundus image quality is insufficient for reliable analysis.",
-
+            "message": "Fundus image quality is insufficient for reliable analysis.",
             "quality": quality,
-
             "prediction": None,
-
-            "recommendation":
-                "Please capture another fundus image with better focus, illumination and field of view."
+            "recommendation": "Please capture another fundus image with better focus, illumination and field of view."
         }
-
 
     # --------------------------------------------------------
     # MODEL
@@ -776,168 +504,84 @@ def analyze(image_path):
 
     model = load_model()
 
-
     # --------------------------------------------------------
     # PREPROCESS
     # --------------------------------------------------------
 
-    tensor = preprocess_image(
-        image_path
-    )
-
+    tensor = preprocess_image(image_path)
 
     # --------------------------------------------------------
-    # PREDICTION
+    # PREDICTION + GRAD-CAM (single pass)
     # --------------------------------------------------------
 
-    print(
-        "Running DR prediction...",
-        file=sys.stderr
-    )
+    print("Running DR prediction and Grad-CAM...", file=sys.stderr)
 
-    with torch.no_grad():
+    # Last convolutional layer of ResNet50
+    target_layer = model.layer4[-1]
 
-        output = model(
-            tensor
-        )
+    gradcam = GradCAM(model, target_layer)
 
-        score = (
-            output.squeeze().item()
-        )
+    cam, score = gradcam.generate(tensor)
 
-    print(
-        f"Raw DR model score: {score:.4f}",
-        file=sys.stderr,
-        flush=True
-    )
+    gradcam.close()
 
+    print(f"Raw DR model score: {score:.4f}", file=sys.stderr, flush=True)
 
     # --------------------------------------------------------
     # Convert regression score to DR grade
     # --------------------------------------------------------
 
-    score = max(
-        0.0,
-        min(
-            4.0,
-            score
-        )
-    )
+    score = max(0.0, min(4.0, score))
 
-    predicted_index = int(
-        round(score)
-    )
+    predicted_index = int(round(score))
+    predicted_index = max(0, min(4, predicted_index))
 
-    predicted_index = max(
-        0,
-        min(
-            4,
-            predicted_index
-        )
-    )
-
-    predicted_class = CLASSES[
-        predicted_index
-    ]
-
-
-    # --------------------------------------------------------
-    # GRAD-CAM
-    # --------------------------------------------------------
-
-    print(
-        "Generating Grad-CAM...",
-        file=sys.stderr
-    )
-
-    # Last convolutional layer of ResNet50
-    target_layer = (
-        model.layer4[-1]
-    )
-
-    gradcam = GradCAM(
-        model,
-        target_layer
-    )
-
-    cam = gradcam.generate(
-        tensor
-    )
-
-    gradcam.close()
-
+    predicted_class = CLASSES[predicted_index]
 
     # --------------------------------------------------------
     # SAVE HEATMAP
     # --------------------------------------------------------
 
     filename = (
-        os.path.splitext(
-            os.path.basename(
-                image_path
-            )
-        )[0]
-        +
-        "_gradcam.jpg"
+        os.path.splitext(os.path.basename(image_path))[0]
+        + "_gradcam.jpg"
     )
 
-    # Absolute filesystem path for Node.js.
-    heatmap_path = os.path.join(
-        OUTPUT_DIR,
-        filename
-    )
+    heatmap_path = os.path.join(OUTPUT_DIR, filename)
 
-    # URL path is intentionally NOT generated here.
-    # Node.js should expose /outputs as a static directory.
-    # This keeps Python independent of the Render domain.
-
-    save_gradcam(
-        image_path,
-        cam,
-        heatmap_path
-    )
-
+    save_gradcam(image_path, cam, heatmap_path)
 
     # --------------------------------------------------------
     # FINAL RESULT
     # --------------------------------------------------------
 
     result = {
-
         "status": "success",
-
         "quality": quality,
-
         "prediction": {
-
             "class": predicted_class,
-
             "grade": predicted_index,
-
-            "severityScore": round(
-                float(score),
-                3
-            )
+            "severityScore": round(float(score), 3)
         },
-
         "explainability": {
-
-            # Absolute path: Node can use this to construct the public URL.
             "gradcam": heatmap_path,
-
-            # Filename: convenient for serving /outputs/<filename>.
             "gradcamFilename": filename,
-
-            "description":
-                "Highlighted regions show areas that contributed strongly to the model's DR severity prediction."
+            "description": "Highlighted regions show areas that contributed strongly to the model's DR severity prediction."
         },
-
-        "recommendation":
-            get_recommendation(
-                predicted_index
-            )
+        "recommendation": get_recommendation(predicted_index)
     }
 
+    # --------------------------------------------------------
+    # MEMORY CLEANUP
+    # --------------------------------------------------------
+    # Explicitly release the input tensor and heatmap array, then
+    # force garbage collection right after the memory-heavy step
+    # rather than waiting for it to happen on its own. This matters
+    # more on a tight (e.g. 512MB) instance than it would with
+    # plenty of headroom.
+
+    del tensor, cam
+    gc.collect()
 
     return result
 
@@ -946,40 +590,33 @@ def analyze(image_path):
 # RECOMMENDATION
 # ============================================================
 
-def get_recommendation(
-    grade
-):
+def get_recommendation(grade):
 
     if grade == 0:
-
         return (
             "No apparent diabetic retinopathy. "
             "Routine screening should still be maintained."
         )
 
     elif grade == 1:
-
         return (
             "Mild diabetic retinopathy detected. "
             "Consider ophthalmic evaluation and follow-up."
         )
 
     elif grade == 2:
-
         return (
             "Moderate diabetic retinopathy detected. "
             "Ophthalmic evaluation is recommended."
         )
 
     elif grade == 3:
-
         return (
             "Severe diabetic retinopathy suspected. "
             "Prompt ophthalmic evaluation is recommended."
         )
 
     else:
-
         return (
             "Proliferative diabetic retinopathy suspected. "
             "Urgent ophthalmic evaluation is recommended."
@@ -996,47 +633,27 @@ if __name__ == "__main__":
 
         print(
             json.dumps({
-
                 "status": "error",
-
-                "message":
-                    "Image path required."
-
+                "message": "Image path required."
             }),
-
             file=sys.stdout
         )
 
         sys.exit(1)
 
-
     image_path = sys.argv[1]
 
-
     try:
+        result = analyze(image_path)
 
-        result = analyze(
-            image_path
-        )
-
-        print(
-            json.dumps(
-                result,
-                indent=2
-            )
-        )
-
+        print(json.dumps(result, indent=2))
 
     except Exception as e:
 
         print(
             json.dumps({
-
                 "status": "error",
-
-                "message":
-                    str(e)
-
+                "message": str(e)
             })
         )
 
