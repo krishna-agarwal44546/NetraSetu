@@ -3,16 +3,23 @@ const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const { spawn } = require("child_process");
+const axios = require("axios");
+const FormData = require("form-data");
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
+
+// ============================================================
+// AI SERVICE URL
+// ============================================================
+
+const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "https://netrasetu-1.onrender.com";
 
 // ============================================================
 // MIDDLEWARE
 // ============================================================
 
-app.use(cors());
+app.use(cors({ origin: process.env.FRONTEND_URL || "https://netrasetu-3.onrender.com" }));
 app.use(express.json());
 
 // ============================================================
@@ -21,32 +28,13 @@ app.use(express.json());
 
 const backendDir = __dirname;
 
-// ../ai
-const aiDir = path.join(backendDir, "..", "ai");
-
-// Python inference script
-const pythonScript = path.join(aiDir, "inference.py");
-
 // Upload directory
 const uploadDir = path.join(backendDir, "uploads");
 
-// AI output directory
-const outputDir = path.join(aiDir, "outputs");
-
-// Create directories if they don't exist
+// Create directory if it doesn't exist
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
 }
-
-if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-}
-
-// ============================================================
-// SERVE GRAD-CAM / AI OUTPUTS
-// ============================================================
-
-app.use("/outputs", express.static(outputDir));
 
 // ============================================================
 // MULTER CONFIGURATION
@@ -107,189 +95,55 @@ app.get("/", (req, res) => {
 // AI ANALYSIS ROUTE
 // ============================================================
 
-app.post("/api/analyze", upload.single("image"), (req, res) => {
-
+app.post("/api/analyze", upload.single("image"), async (req, res) => {
     console.log("\n======================================");
     console.log("New image analysis request");
     console.log("======================================");
 
-    // Check image
     if (!req.file) {
-
-        return res.status(400).json({
-            status: "error",
-            message: "No image uploaded"
-        });
+        return res.status(400).json({ status: "error", message: "No image uploaded" });
     }
 
     const imagePath = req.file.path;
+    console.log("Uploaded image:", imagePath);
+    console.log("Forwarding to AI service:", AI_SERVICE_URL);
 
-    console.log("Uploaded image:");
-    console.log(imagePath);
+    try {
+        const form = new FormData();
+        form.append("image", fs.createReadStream(imagePath));
 
-    console.log("\nPython script:");
-    console.log(pythonScript);
+        const aiResponse = await axios.post(`${AI_SERVICE_URL}/analyze`, form, {
+            headers: form.getHeaders(),
+            timeout: 60000 // AI inference can be slow on Render's free tier / cold starts
+        });
 
-    // Check inference.py
-    if (!fs.existsSync(pythonScript)) {
+        const result = aiResponse.data;
 
-        console.error("ERROR: inference.py not found");
+        const baseUrl = `${req.protocol}://${req.get("host")}`;
+
+        if (result.gradcam) {
+            // If the AI service returns the Grad-CAM image itself (e.g. base64 or its own URL),
+            // adjust this depending on what /analyze actually sends back.
+            result.gradcamUrl = result.gradcam.startsWith("http")
+                ? result.gradcam
+                : `${AI_SERVICE_URL}/outputs/${path.basename(result.gradcam)}`;
+        }
+
+        result.imageUrl = `${baseUrl}/uploads/${path.basename(imagePath)}`;
+
+        console.log("\nAI RESULT:", result);
+        return res.json(result);
+
+    } catch (error) {
+        console.error("\nAI service call failed:");
+        console.error(error.message);
 
         return res.status(500).json({
             status: "error",
-            message: "Python inference script not found",
-            path: pythonScript
+            message: "AI inference failed",
+            details: error.response?.data || error.message
         });
     }
-
-    console.log("\nStarting PyTorch inference...");
-
-    // ========================================================
-    // RUN PYTHON
-    // ========================================================
-
-    const python = spawn("python3", [
-        pythonScript,
-        imagePath
-    ]);
-
-    let stdout = "";
-    let stderr = "";
-
-    // ========================================================
-    // PYTHON STDOUT
-    // ========================================================
-
-    python.stdout.on("data", (data) => {
-
-        const text = data.toString();
-
-        stdout += text;
-
-        console.log("[AI OUTPUT]", text.trim());
-    });
-
-    // ========================================================
-    // PYTHON STDERR
-    // ========================================================
-
-    python.stderr.on("data", (data) => {
-
-        const text = data.toString();
-
-        stderr += text;
-
-        console.error("[AI LOG]", text.trim());
-    });
-
-    // ========================================================
-    // PYTHON ERROR
-    // ========================================================
-
-    python.on("error", (error) => {
-
-        console.error("Failed to start Python:");
-        console.error(error);
-
-        return res.status(500).json({
-            status: "error",
-            message: "Could not start Python",
-            details: error.message
-        });
-    });
-
-    // ========================================================
-    // PYTHON FINISHED
-    // ========================================================
-
-    python.on("close", (code) => {
-
-        console.log("\nPython process finished");
-        console.log("Exit code:", code);
-
-        // ----------------------------------------------------
-        // PYTHON FAILED
-        // ----------------------------------------------------
-
-        if (code !== 0) {
-
-            console.error("Python inference failed");
-
-            console.error(stderr);
-
-            return res.status(500).json({
-                status: "error",
-                message: "AI inference failed",
-                details: stderr
-            });
-        }
-
-        // ----------------------------------------------------
-        // PYTHON SUCCESS
-        // ----------------------------------------------------
-
-        try {
-
-            /*
-             * inference.py should print ONLY JSON to stdout.
-             *
-             * Example:
-             *
-             * {
-             *   "status": "success",
-             *   "prediction": "Moderate DR",
-             *   "confidence": 0.91,
-             *   "quality": {...},
-             *   "gradcam": "fundus_gradcam.jpg"
-             * }
-             */
-
-            const result = JSON.parse(stdout.trim());
-
-            // ------------------------------------------------
-            // ADD GRAD-CAM URL
-            // ------------------------------------------------
-
-            if (result.gradcam) {
-
-                // If Python returns:
-                // fundus_gradcam.jpg
-
-                result.gradcamUrl =
-                    `http://localhost:${PORT}/outputs/${path.basename(result.gradcam)}`;
-            }
-
-            // ------------------------------------------------
-            // ADD ORIGINAL IMAGE URL
-            // ------------------------------------------------
-
-            result.imageUrl =
-                `http://localhost:${PORT}/uploads/${path.basename(imagePath)}`;
-
-            console.log("\nAI RESULT:");
-            console.log(result);
-
-            // ------------------------------------------------
-            // SEND TO REACT
-            // ------------------------------------------------
-
-            return res.json(result);
-
-        } catch (error) {
-
-            console.error("\nJSON parsing failed!");
-
-            console.error("Raw Python output:");
-            console.error(stdout);
-
-            return res.status(500).json({
-                status: "error",
-                message: "Python returned invalid JSON",
-                pythonOutput: stdout,
-                pythonError: stderr
-            });
-        }
-    });
 });
 
 // ============================================================
@@ -322,16 +176,9 @@ app.listen(PORT, () => {
     console.log("Diabetic Retinopathy Backend");
     console.log("======================================");
 
-    console.log(`Server: http://localhost:${PORT}`);
-
-    console.log("\nPython:");
-    console.log(pythonScript);
-
-    console.log("\nUpload directory:");
-    console.log(uploadDir);
-
-    console.log("\nAI output directory:");
-    console.log(outputDir);
+    console.log(`Server running on port: ${PORT}`);
+    console.log("AI service URL:", AI_SERVICE_URL);
+    console.log("Upload directory:", uploadDir);
 
     console.log("\nWaiting for images...\n");
 });
