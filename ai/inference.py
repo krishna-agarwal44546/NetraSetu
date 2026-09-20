@@ -25,6 +25,15 @@ MODEL_REPO = "ClementP/FundusDRGrading-resnet18"
 # more headroom (e.g. running locally or on a bigger instance).
 INPUT_SIZE = int(os.getenv("INPUT_SIZE", "256"))
 
+# Grad-CAM requires a backward pass through the whole network,
+# which roughly doubles memory use versus a plain forward pass.
+# On a tight instance (e.g. Render's free 512MB tier) this is
+# often enough to get the process OOM-killed mid-request. Default
+# to OFF so core DR prediction works reliably; set ENABLE_GRADCAM=true
+# in the environment (e.g. when running locally, or on a bigger
+# instance) to bring the heatmap back.
+ENABLE_GRADCAM = os.getenv("ENABLE_GRADCAM", "false").lower() == "true"
+
 # Absolute paths make the script work when Node.js launches it
 # from a different working directory (important on Render).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -152,7 +161,7 @@ def load_model():
     )
 
     # This checkpoint uses regression:
-    # fc = Linear(2048, 1)
+    # fc = Linear(512, 1)   (ResNet18's final feature dim is 512, vs 2048 for ResNet50)
     #
     # The output is a continuous DR severity score from which
     # the prototype maps to grades 0-4 below.
@@ -511,19 +520,54 @@ def analyze(image_path):
     tensor = preprocess_image(image_path)
 
     # --------------------------------------------------------
-    # PREDICTION + GRAD-CAM (single pass)
+    # PREDICTION (+ optional Grad-CAM)
     # --------------------------------------------------------
 
-    print("Running DR prediction and Grad-CAM...", file=sys.stderr)
+    cam = None
+    gradcam_failed = False
 
-    # Last convolutional layer of ResNet50
-    target_layer = model.layer4[-1]
+    if ENABLE_GRADCAM:
 
-    gradcam = GradCAM(model, target_layer)
+        print("Running DR prediction and Grad-CAM...", file=sys.stderr)
 
-    cam, score = gradcam.generate(tensor)
+        # Last convolutional layer of ResNet18 (BasicBlock, not
+        # Bottleneck — same attribute name, still works the same way)
+        target_layer = model.layer4[-1]
 
-    gradcam.close()
+        gradcam = GradCAM(model, target_layer)
+
+        try:
+            cam, score = gradcam.generate(tensor)
+
+        except Exception as e:
+            # If this ever raises a genuine Python exception (as
+            # opposed to the process being OOM-killed outright,
+            # which can't be caught), fall back to a plain forward
+            # pass rather than failing the whole request.
+            print(
+                f"Grad-CAM failed ({e}), falling back to forward-only prediction.",
+                file=sys.stderr,
+                flush=True
+            )
+            gradcam_failed = True
+
+            with torch.no_grad():
+                output = model(tensor)
+                score = output[0, 0].item()
+
+        finally:
+            gradcam.close()
+
+    else:
+
+        print("Running DR prediction (Grad-CAM disabled)...", file=sys.stderr)
+
+        # Forward-only pass. No backward() means no autograd graph
+        # is built, which is the main memory saving here.
+        with torch.no_grad():
+            output = model(tensor)
+            score = output[0, 0].item()
+            del output
 
     print(f"Raw DR model score: {score:.4f}", file=sys.stderr, flush=True)
 
@@ -539,17 +583,33 @@ def analyze(image_path):
     predicted_class = CLASSES[predicted_index]
 
     # --------------------------------------------------------
-    # SAVE HEATMAP
+    # SAVE HEATMAP (only if Grad-CAM actually ran)
     # --------------------------------------------------------
 
-    filename = (
-        os.path.splitext(os.path.basename(image_path))[0]
-        + "_gradcam.jpg"
-    )
+    explainability = None
 
-    heatmap_path = os.path.join(OUTPUT_DIR, filename)
+    if cam is not None:
 
-    save_gradcam(image_path, cam, heatmap_path)
+        filename = (
+            os.path.splitext(os.path.basename(image_path))[0]
+            + "_gradcam.jpg"
+        )
+
+        heatmap_path = os.path.join(OUTPUT_DIR, filename)
+
+        save_gradcam(image_path, cam, heatmap_path)
+
+        explainability = {
+            "gradcam": heatmap_path,
+            "gradcamFilename": filename,
+            "description": "Highlighted regions show areas that contributed strongly to the model's DR severity prediction."
+        }
+
+    elif ENABLE_GRADCAM and gradcam_failed:
+        explainability = {
+            "gradcam": None,
+            "description": "Grad-CAM heatmap could not be generated for this request; showing prediction only."
+        }
 
     # --------------------------------------------------------
     # FINAL RESULT
@@ -563,11 +623,7 @@ def analyze(image_path):
             "grade": predicted_index,
             "severityScore": round(float(score), 3)
         },
-        "explainability": {
-            "gradcam": heatmap_path,
-            "gradcamFilename": filename,
-            "description": "Highlighted regions show areas that contributed strongly to the model's DR severity prediction."
-        },
+        "explainability": explainability,
         "recommendation": get_recommendation(predicted_index)
     }
 
