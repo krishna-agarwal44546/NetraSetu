@@ -16,7 +16,7 @@ from huggingface_hub import hf_hub_download
 # CONFIG
 # ============================================================
 
-MODEL_REPO = "ClementP/FundusDRGrading-resnet18"
+MODEL_REPO = "ClementP/FundusDRGrading-resnet50"
 
 # Lowered from 512 -> 256 by default. This roughly quarters the
 # memory used by every activation map in the network (memory
@@ -166,7 +166,7 @@ def load_model():
     # The output is a continuous DR severity score from which
     # the prototype maps to grades 0-4 below.
     model = timm.create_model(
-        "resnet18",
+        "resnet50",
         pretrained=False,
         num_classes=1
     )
